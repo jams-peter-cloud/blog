@@ -1,0 +1,9 @@
+<!-- 简单头像图标 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="96" height="96">
+  <!-- 外圈背景 -->
+  <circle cx="32" cy="32" r="30" fill="#2a3550" stroke="#5e6a86" stroke-width="2"/>
+  <!-- 头部 -->
+  <circle cx="32" cy="25" r="10" fill="#cbd6e2"/>
+  <!-- 身体 -->
+  <path d="M16 54c0-9 7-16 16-16s16 7 16 16" fill="#cbd6e2"/>
+</svg>

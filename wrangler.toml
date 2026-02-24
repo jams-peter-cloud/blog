@@ -1,0 +1,19 @@
+name = "blog" # Worker 名称
+main = "src/worker.js" # 入口脚本（模块模式）
+compatibility_date = "2026-02-20" # 运行时兼容日期
+workers_dev = true # 使用 *.workers.dev 子域调试/部署
+assets = { directory = "./public", binding = "ASSETS", run_worker_first = true } # 绑定静态资源目录并优先运行 Worker
+[[kv_namespaces]] # 自动创建并绑定 KV（用于文章存储）
+binding = "POSTS" # KV 绑定名（env.POSTS）
+id = "91ee2d77b3b446cc8cfec0085701bfbb" # KV 命名空间 ID，请替换为你的实际 ID
+[[kv_namespaces]] # 自动创建并绑定 KV（用于评论存储）
+binding = "COMMENTS" # KV 绑定名（env.COMMENTS）
+id = "8f4384f368034dc8b2f03e2bd6ba8adb" # 请替换为你的实际评论 KV 命名空间 ID
+[[kv_namespaces]] # 自动创建并绑定 KV（用于图片存储）
+binding = "IMAGES" # KV 绑定名（env.IMAGES）
+id = "45f11b81dbd1468795de90973b2e8590" # 请替换为你的实际图片 KV 命名空间 ID
+[observability] # 可观测性配置
+enabled = true # 启用可观测性
+head_sampling_rate = 1 # 采样率
+[vars]
+ADMIN_TOKEN = "123456" # 请替换为您的实际 token
