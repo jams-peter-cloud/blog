@@ -1,3 +1,5 @@
+import { marked } from 'marked'; // 导入 marked 库
+
 // 导出默认对象以使用模块 Worker 接口
 export default { // 导出默认处理器对象
   async fetch(req, env) { // 处理每个进入的请求
@@ -16,8 +18,23 @@ export default { // 导出默认处理器对象
 
     if (path === "/ide/build") { // 匹配 IDE 构建页面
       const token = url.searchParams.get("token") || ""; // 从查询参数读取 token
-      if (!token || !env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN) { // 校验 token 与环境变量
-        return html('<p>缺少 token，请在 URL 添加 ?token=YOUR_TOKEN</p>'); // 返回提示页面
+      if (!env.ADMIN_TOKEN) { // 检查是否配置了 ADMIN_TOKEN
+        return html(`
+          <div style="padding: 20px; font-family: sans-serif;">
+            <h2>未配置管理员 Token</h2>
+            <p>请在 Cloudflare 控制台或 wrangler.toml 中设置 <code>ADMIN_TOKEN</code> 环境变量。</p>
+            <p>当前环境变量状态: <b>未定义</b></p>
+          </div>
+        `);
+      }
+      if (!token || token !== env.ADMIN_TOKEN) { // 校验 token
+        return html(`
+          <div style="padding: 20px; font-family: sans-serif;">
+            <h2>验证失败</h2>
+            <p>请在 URL 中添加正确的 token，例如：<code>?token=YOUR_TOKEN</code></p>
+            <p style="color: #666; font-size: 0.9em;">提示：您设置的 token 长度为 ${env.ADMIN_TOKEN.length} 位</p>
+          </div>
+        `);
       } // 结束 token 校验
       const posts = await loadPostsIndexAll(env); // 加载所有文章
       return html(renderIdePage(env, posts)); // 返回 IDE 管理页面，并传递文章列表
@@ -81,7 +98,7 @@ export default { // 导出默认处理器对象
     } // 结束 /api/posts/:slug PUT 分支
 
     if (path.startsWith("/api/posts/") && req.method === "GET") { // 匹配获取单篇文章接口
-      const slug = path.slice("/api/posts/".length); // 从路径中提取 slug
+      const slug = decodeURIComponent(path.slice("/api/posts/".length)); // 提取并解码 slug
       const post = await loadPost(env, slug); // 加载文章
       if (post) { // 如果文章存在
         return new Response(JSON.stringify(post), { headers: { "content-type": "application/json" } }); // 返回文章 JSON
@@ -222,74 +239,122 @@ function notFound() { // 定义 404 响应函数
 
 // 归一化路径，去除多余斜杠并保证前导斜杠
 function normalizePath(p) { // 定义路径归一化函数
-  if (!p) return "/"; // 空路径返回根路径
+  if (!p || p === "/") return "/"; // 空路径或根路径直接返回
   let x = p.replace(/\\+/g, "/"); // 替换反斜杠为正斜杠
-  x = x.replace(/\/\/+/, "/"); // 合并多余斜杠
-  if (!x.startsWith("/")) x = "/" + x; // 确保前导斜杠
-  return x; // 返回归一化路径
+  x = x.replace(/\/+$/, ""); // 去除末尾斜杠
+  x = x.replace(/\/+/g, "/"); // 合并重复斜杠
+  if (!x.startsWith("/")) x = "/" + x; // 确保以斜杠开头
+  return x; // 返回处理后的路径
 } // 结束 normalizePath 函数
 
 // 从静态资源加载文章索引
 async function loadPostsIndex(env) { // 定义加载文章索引函数
-  const r = await env.ASSETS.fetch("https://assets.local/posts.json"); // 通过绑定获取 posts.json
-  if (!r.ok) return []; // 若文件不存在返回空列表
-  return r.json(); // 返回解析后的 JSON 数组
+  try {
+    if (!env.ASSETS) return []; // 若未绑定 ASSETS 返回空
+    // 在 Cloudflare Workers 中，env.ASSETS.fetch 期望一个 Request 对象或 URL 字符串
+    // 使用 assets.local 域名是正确的，但需要确保它是通过内部绑定访问的
+    const r = await env.ASSETS.fetch(new Request("https://assets.local/posts.json")); // 通过绑定获取 posts.json
+    if (!r.ok) {
+      console.warn("posts.json not found in assets, status:", r.status);
+      return []; // 若文件不存在返回空列表
+    }
+    return await r.json(); // 返回解析后的 JSON 数组
+  } catch (e) {
+    console.error("loadPostsIndex error:", e);
+    return [];
+  }
 } // 结束 loadPostsIndex 函数
 
 // 从 KV 与静态资源合并加载索引
 async function loadPostsIndexAll(env) { // 定义合并索引加载函数
-  const a = await loadPostsIndex(env); // 加载静态索引
-  const b = await getIndexFromKV(env); // 加载 KV 索引
-  console.log(`Static index: ${JSON.stringify(a)}`); // 记录静态索引
-  console.log(`KV index: ${JSON.stringify(b)}`); // 记录 KV 索引
-  const map = new Map(); // 创建去重映射
-  [...a, ...b].forEach(it => { if (it && it.slug) map.set(it.slug, it); }); // 合并并按 slug 去重
-  const merged = [...map.values()].sort((x, y) => String(y.date || "").localeCompare(String(x.date || ""))); // 按日期倒序
-  console.log(`Merged index: ${JSON.stringify(merged)}`); // 记录合并后的索引
-  return merged; // 返回合并后的索引
+  try {
+    const a = await loadPostsIndex(env); // 加载静态索引
+    const b = await getIndexFromKV(env); // 加载 KV 索引
+    
+    // 调试日志：在生产环境中查看 Cloudflare Logs
+    console.log(`Loaded ${a.length} posts from Assets and ${b.length} posts from KV`);
+    
+    const map = new Map(); // 创建去重映射
+    
+    // 先处理静态文章
+    if (Array.isArray(a)) {
+      a.forEach(it => { if (it && it.slug) map.set(it.slug, it); });
+    }
+    
+    // 后处理 KV 文章（KV 版本优先）
+    if (Array.isArray(b)) {
+      b.forEach(it => { if (it && it.slug) map.set(it.slug, it); });
+    }
+    
+    const merged = [...map.values()].sort((x, y) => {
+      const dateX = x.date || "0000-00-00";
+      const dateY = y.date || "0000-00-00";
+      return dateY.localeCompare(dateX);
+    });
+    
+    return merged; // 返回合并后的索引
+  } catch (e) {
+    console.error("Error in loadPostsIndexAll:", e);
+    return [];
+  }
 } // 结束 loadPostsIndexAll 函数
 
 // 从静态资源加载指定文章 Markdown
 async function loadPostMarkdown(env, slug) { // 定义加载单篇文章函数
-  const safe = slug.replace(/[^a-z0-9-]/gi, ""); // 过滤 slug 仅保留安全字符
-  const url = `https://assets.local/posts/${safe}.md`; // 构造静态资源路径
-  const r = await env.ASSETS.fetch(url); // 通过绑定获取 Markdown 文件
-  if (!r.ok) return null; // 若未找到返回 null
-  return r.text(); // 返回 Markdown 文本
+  // 直接使用经过 sanitizeSlug 处理后的 slug，不再进行二次过滤，确保与文件名一致
+  const url = `https://assets.local/posts/${slug}.md`; // 构造静态资源路径
+  try {
+    const r = await env.ASSETS.fetch(new Request(url)); // 通过绑定获取 Markdown 文件
+    if (!r.ok) {
+      console.warn(`Markdown file not found: ${url} (Status: ${r.status})`);
+      return null;
+    }
+    return await r.text(); // 返回 Markdown 文本
+  } catch (e) {
+    console.error(`Error loading markdown for ${slug} from ${url}:`, e);
+    return null;
+  }
 } // 结束 loadPostMarkdown 函数
 
 // 从 KV 或静态资源读取文章
 async function loadPost(env, slug) { // 定义综合加载文章函数
-  const s = sanitizeSlug(slug); // 规范化 slug
-  const kv = await loadPostFromKV(env, s); // 尝试读取 KV
-  if (kv) {
-    console.log(`Loaded post from KV: ${JSON.stringify(kv)}`); // 记录从 KV 加载的文章
-    return kv; // 若存在返回 KV 版本
+  // 不要在加载时强行 sanitizeSlug，因为静态资源的文件名可能包含大写字母或特殊字符
+  // 我们应该优先使用原始传入的 slug 进行匹配
+  const kv = await loadPostFromKV(env, slug); // 尝试使用原始 slug 读取 KV
+  if (kv) return kv;
+
+  // 如果 KV 没找到，再尝试一下规范化后的 slug（兼容旧数据）
+  const s = sanitizeSlug(slug);
+  if (s !== slug) {
+    const kv2 = await loadPostFromKV(env, s);
+    if (kv2) return kv2;
   }
-  const md = await loadPostMarkdown(env, s); // 否则读取静态 Markdown
-  if (!md) return null; // 未找到返回空
-  const post = { slug: s, title: s, date: "", desc: "", format: "md", content: md }; // 封装结构
-  console.log(`Loaded post from Markdown: ${JSON.stringify(post)}`); // 记录从 Markdown 加载的文章
-  return post; // 返回封装后的文章
+
+  // 尝试读取静态 Markdown
+  const md = await loadPostMarkdown(env, slug); // 使用原始 slug
+  if (md !== null) {
+    return { slug: slug, title: slug, date: "", desc: "", format: "md", content: md };
+  }
+
+  // 最后尝试规范化后的路径读取静态资源
+  if (s !== slug) {
+    const md2 = await loadPostMarkdown(env, s);
+    if (md2 !== null) {
+      return { slug: s, title: s, date: "", desc: "", format: "md", content: md2 };
+    }
+  }
+
+  return null; // 全都没找到
 } // 结束 loadPost 函数
 
-// 极简 Markdown 转 HTML（标题/粗体/斜体/链接/段落）
-function markdownToHtml(md) { // 定义 Markdown 转换函数
-  let s = md; // 复制输入字符串
-
-  s = s.replace(/^###\s+(.+)$/gm, '<h3>$1</h3>'); // 处理三级标题
-  s = s.replace(/^##\s+(.+)$/gm, '<h2>$1</h2>'); // 处理二级标题
-  s = s.replace(/^#\s+(.+)$/gm, '<h1>$1</h1>'); // 处理一级标题
-
-  s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>'); // 处理粗体
-  s = s.replace(/\*(.+?)\*/g, '<em>$1</em>'); // 处理斜体
-  s = s.replace(/!\[(.+?)\]\((.+?)\)/g, '<img src="$2" alt="$1">'); // 处理图片
-  s = s.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2">$1<\/a>'); // 处理链接
-  s = s.replace(/\n{2,}/g, '\n\n'); // 将多个连续换行符替换为两个，形成段落分隔
-  s = s.replace(/([^\n])\n([^\n])/g, '$1<br>$2'); // 将单个换行符替换为 <br>
-  s = s.replace(/^(?!<h\d>|<ul>|<li>|<p>|<blockquote>|<pre>|<code>|<\/)(.+)$/gm, '<p>$1<\/p>'); // 包裹普通行
-  return s; // 返回转换后的 HTML 片段
-} // 结束 markdownToHtml 函数
+// 使用 marked 库进行 Markdown 转 HTML
+function markdownToHtml(md) {
+  // 1. 处理自定义代码块语法 '''
+  const processedMd = md.replace(/'''(\w*)\n?([\s\S]*?)'''/g, '```$1\n$2\n```');
+  
+  // 2. 使用 marked 解析
+  return marked.parse(processedMd);
+}
 
 // 渲染 IDE 管理页面
 function renderIdePage(env, posts) {
@@ -315,10 +380,25 @@ function renderIdePage(env, posts) {
         <label>文章 Slug: <input type="text" id="ide-slug" style="width:100%;padding:8px;margin:6px 0;"/></label>
         <label>文章标题: <input type="text" id="ide-title" style="width:100%;padding:8px;margin:6px 0;"/></label>
         <label>文章摘要: <input type="text" id="ide-desc" style="width:100%;padding:8px;margin:6px 0;"/></label>
-        <label>Format <select id="ide-format" style="width:100%;padding:8px;margin:6px 0;"><option value="md">Markdown</option><option value="html">HTML</option></select></label>
+        <label>文章格式: 
+          <select id="ide-format" style="width:100%;padding:8px;margin:6px 0;">
+            <option value="md">Markdown</option>
+            <option value="html">HTML</option>
+          </select>
+        </label>
         <label>Tags (逗号分隔) <input type="text" id="ide-tags" style="width:100%;padding:8px;margin:6px 0;" placeholder="tag1, tag2"/></label>
-        <textarea id="ide-content" style="width:100%;height:400px;padding:8px;margin:6px 0;" placeholder="# 标题\n\n正文..."></textarea>
-        <button id="ide-save-post" style="padding:10px 15px;background-color:#28a745;color:white;border:none;border-radius:5px;cursor:pointer;">保存文章</button>
+        
+        <div style="display: flex; gap: 20px; margin-top: 10px;">
+          <div style="flex: 2;">
+            <label>文章内容 (Markdown/HTML): <textarea id="ide-content" style="width:100%;height:600px;padding:8px;margin:6px 0; font-family: monospace; background: rgba(0,0,0,0.3); color: #fff; border: 1px solid rgba(255,255,255,0.1); border-radius: 4px;" placeholder="# 标题\n\n正文...\n\n'''\n这里的内容不会被解析为 Markdown\n可以放代码或纯文本\n'''"></textarea></label>
+          </div>
+          <div style="flex: 1; display: flex; flex-direction: column; min-width: 0;">
+            <label>实时预览:</label>
+            <div id="markdown-content" class="post" style="flex: 1; padding: 20px; margin: 6px 0; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; overflow-y: scroll; background: rgba(21, 28, 45, 0.6); height: 600px; max-height: 600px; font-size: 0.9em; box-sizing: border-box;"></div>
+          </div>
+        </div>
+        
+        <button id="ide-save-post" style="padding:10px 15px;background-color:#28a745;color:white;border:none;border-radius:5px;cursor:pointer;margin-top:10px;">保存文章</button>
       </div>
 
       <div class="ide-card">
@@ -332,7 +412,85 @@ function renderIdePage(env, posts) {
       </div>
     </section>
     <script>
-      const ADMIN_TOKEN = "${env.ADMIN_TOKEN}";
+      const ADMIN_TOKEN = "${String(env.ADMIN_TOKEN).replace(/"/g, '\\"')}";
+      
+      // 预览功能
+      const ideContentInput = document.getElementById('ide-content');
+      const previewDiv = document.getElementById('markdown-content');
+      const formatSelect = document.getElementById('ide-format');
+
+      function updatePreview() {
+        if (typeof marked === 'undefined') {
+          previewDiv.innerHTML = '正在加载解析器...';
+          return;
+        }
+
+        const text = ideContentInput.value;
+        const format = formatSelect.value;
+        
+        if (format === 'html') {
+           previewDiv.innerHTML = text;
+        } else {
+           // 使用简单的字符串替换，避免在模板字符串中嵌套复杂正则导致的转义问题
+           let processed = text;
+           const parts = text.split("'''");
+           if (parts.length > 1) {
+             let newText = "";
+             for (let i = 0; i < parts.length; i++) {
+               if (i % 2 === 1) {
+                 const content = parts[i];
+                 const firstNewline = content.indexOf('\\n');
+                 if (firstNewline !== -1) {
+                   const lang = content.substring(0, firstNewline).trim();
+                   const code = content.substring(firstNewline + 1);
+                   newText += "\\n\`\`\`" + lang + "\\n" + code + "\\n\`\`\`\\n";
+                 } else {
+                   newText += "\\n\`\`\`\\n" + content + "\\n\`\`\`\\n";
+                 }
+               } else {
+                 newText += parts[i];
+               }
+             }
+             processed = newText;
+           }
+           
+           // 解析 Markdown
+           previewDiv.innerHTML = marked.parse(processed);
+           
+           // 手动触发高亮
+           if (typeof hljs !== 'undefined') {
+             previewDiv.querySelectorAll('pre code').forEach((el) => {
+               hljs.highlightElement(el);
+             });
+           }
+        }
+      }
+
+      // 监听输入
+      ideContentInput.addEventListener('input', updatePreview);
+      formatSelect.addEventListener('change', updatePreview);
+
+      // 滚动同步功能
+      let isScrolling = false;
+
+      ideContentInput.addEventListener('scroll', () => {
+        if (isScrolling) return;
+        isScrolling = true;
+        const percentage = ideContentInput.scrollTop / (ideContentInput.scrollHeight - ideContentInput.clientHeight);
+        previewDiv.scrollTop = percentage * (previewDiv.scrollHeight - previewDiv.clientHeight);
+        setTimeout(() => { isScrolling = false; }, 50); // 增加小延迟防止回环触发
+      });
+
+      previewDiv.addEventListener('scroll', () => {
+        if (isScrolling) return;
+        isScrolling = true;
+        const percentage = previewDiv.scrollTop / (previewDiv.scrollHeight - previewDiv.clientHeight);
+        ideContentInput.scrollTop = percentage * (ideContentInput.scrollHeight - ideContentInput.clientHeight);
+        setTimeout(() => { isScrolling = false; }, 50);
+      });
+      
+      // 初始渲染一次
+      setTimeout(updatePreview, 500);
 
       // Drag & Drop Logic
       const dropZone = document.getElementById('drop-zone');
@@ -466,26 +624,32 @@ function renderIdePage(env, posts) {
         const ideSlugInput = document.getElementById('ide-slug');
         const ideTitleInput = document.getElementById('ide-title');
         const ideDescInput = document.getElementById('ide-desc');
-        const ideFormatInput = document.getElementById('ide-format');
         const ideTagsInput = document.getElementById('ide-tags');
-        const ideContentInput = document.getElementById('ide-content');
 
         if (selectedSlug) {
-          const res = await fetch('/api/posts/' + selectedSlug);
+          // 对 slug 进行编码，并根据需要添加鉴权头（尽管 GET 目前是公开的，但为了统一建议加上）
+          const res = await fetch('/api/posts/' + encodeURIComponent(selectedSlug), {
+            headers: { 'x-admin-token': ADMIN_TOKEN }
+          });
+          
           if (res.ok) {
             const post = await res.json();
-            ideSlugInput.value = post.slug;
-            ideTitleInput.value = post.title;
-            ideDescInput.value = post.desc;
-            ideFormatInput.value = post.format || 'md';
+            ideSlugInput.value = post.slug || '';
+            ideTitleInput.value = post.title || '';
+            ideDescInput.value = post.desc || '';
+            formatSelect.value = post.format || 'md';
             ideTagsInput.value = (post.tags || []).join(', ');
-            ideContentInput.value = post.content;
+            ideContentInput.value = post.content || '';
+            updatePreview();
           } else {
-            alert('获取文章详情失败: ' + res.statusText);
-            ideSlugInput.value = ''; ideTitleInput.value = ''; ideDescInput.value = ''; ideFormatInput.value = 'md'; ideTagsInput.value = ''; ideContentInput.value = '';
+            console.error('Fetch post failed:', res.status, res.statusText);
+            alert('获取文章详情失败 (状态码: ' + res.status + ')。请检查控制台日志。');
+            ideSlugInput.value = ''; ideTitleInput.value = ''; ideDescInput.value = ''; formatSelect.value = 'md'; ideTagsInput.value = ''; ideContentInput.value = '';
+            updatePreview();
           }
         } else {
-          ideSlugInput.value = ''; ideTitleInput.value = ''; ideDescInput.value = ''; ideFormatInput.value = 'md'; ideTagsInput.value = ''; ideContentInput.value = '';
+          ideSlugInput.value = ''; ideTitleInput.value = ''; ideDescInput.value = ''; formatSelect.value = 'md'; ideTagsInput.value = ''; ideContentInput.value = '';
+          updatePreview();
         }
       });
 
@@ -551,13 +715,13 @@ function renderIdePage(env, posts) {
 // 渲染页面通用布局
 function renderLayout(title, inner, env, theme = 'dark-mode') { // 定义布局渲染函数
   const avatarUrl = env.AVATAR_URL || "/avatar.svg"; // 获取头像 URL，如果未设置则使用默认值
-  return `<!doctype html>\n<html lang="zh-CN">\n<head>\n<meta charset="utf-8"/>\n<meta name="viewport" content="width=device-width, initial-scale=1.0"/>\n<title>${escapeHtml(title)}</title>\n<link rel="icon" href="/favicon.ico" type="image/x-icon"/>\n<link rel="shortcut icon" href="/favicon.ico" type="image/x-icon"/>\n<link rel="stylesheet" href="/styles.css"/>\n</head>\n<body class="${theme}">\n<div class="bg"></div>\n<header class="site-header">\n  <div class="wrap">\n    <a href="/" class="brand">我的技术博客</a>\n    <nav class="top-nav">\n      <a href="/">首页</a>\n      <a href="/archives">归档</a>\n      <a href="/tags">标签</a>\n      <a href="/about">关于</a>\n    </nav>\n  </div>
+  return `<!doctype html>\n<html lang="zh-CN">\n<head>\n<meta charset="utf-8"/>\n<meta name="viewport" content="width=device-width, initial-scale=1.0"/>\n<title>${escapeHtml(title)}</title>\n<link rel="icon" href="/favicon.ico" type="image/x-icon"/>\n<link rel="shortcut icon" href="/favicon.ico" type="image/x-icon"/>\n<link rel="stylesheet" href="/styles.css"/>\n<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css"/>\n</head>\n<body class="${theme}">\n<div class="bg"></div>\n<header class="site-header">\n  <div class="wrap">\n    <a href="/" class="brand">我的技术博客</a>\n    <nav class="top-nav">\n      <a href="/">首页</a>\n      <a href="/archives">归档</a>\n      <a href="/tags">标签</a>\n      <a href="/about">关于</a>\n    </nav>\n  </div>
 </header>\n<div class="page">\n  <aside class="sidebar">
     <div class="card profile">
       <img src="${escapeHtml(avatarUrl)}" alt="头像" class="avatar">
       <div class="name">柠檬先生</div>
-      <div class="meta"> jams-peter@outlook.com</div>
-      <div class="meta"> mr.lemon@lemonworld.dpdns.org</div>
+      <div class="meta"> <a href="mailto:jams-peter@outlook.com" target="_blank" style="color: inherit; text-decoration: none;">jams-peter@outlook.com</a></div>
+      <div class="meta"> <a href="mailto:mr.lemon@lemonworld.dpdns.org" target="_blank" style="color: inherit; text-decoration: none;">mr.lemon@lemonworld.dpdns.org</a></div>
       <div class="meta">
         <a href="https://github.com/jams-peter-cloud" target="_blank" style="color: inherit; text-decoration: none;">GitHub</a>
       </div>
@@ -568,7 +732,23 @@ function renderLayout(title, inner, env, theme = 'dark-mode') { // 定义布局�
         <a href="/about">关于</a>
       </nav>
     </div>
-  </aside>\n  <main class="content">${inner}</main>\n</div>\n<footer class="site-footer">© ${new Date().getFullYear()} 我的技术博客 · 基于 HTML/CSS 构建 · 保留所有权利</footer>\n</body>\n</html>`; // 返回完整 HTML 文档
+  </aside>\n  <main class="content">${inner}</main>\n</div>\n<footer class="site-footer">© ${new Date().getFullYear()} 我的技术博客 · 基于 HTML/CSS 构建 · 保留所有权利</footer>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/javascript.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/ini.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script>
+  if (typeof marked !== 'undefined') {
+    marked.use({ breaks: true, gfm: true });
+  }
+  if (typeof hljs !== 'undefined') {
+    hljs.highlightAll();
+  }
+</script>
+</body>\n</html>`; // 返回完整 HTML 文档
 } // 结束 renderLayout 函数
 
 // 渲染首页
@@ -612,53 +792,6 @@ async function renderPost(env, slug, contentHtml, title) { // 定义文章页渲
     '</div>' + // 结束评论表单
     '</section>'; // 结束评论区
   return renderLayout(title, inner, env); // 渲染布局，传入文章标题、内容和环境变量
-    '<button id="submit-comment" style="padding:10px 14px;">提交评论</button>' + // 提交按钮
-    '<span id="comment-msg" style="margin-left:8px;color:#9fb0c1;"></span>' + // 消息提示
-    '</div>' + // 结束评论表单
-    '</section>' + // 结束评论区
-    '<p><a href="/">返回首页</a></p>' + // 返回首页链接
-    '<script>' + // 脚本开始
-    'const submitBtn = document.getElementById(\'submit-comment\');' + // 获取提交按钮
-    'submitBtn.onclick = async () => {' + // 绑定点击事件
-    'const author = document.getElementById(\'comment-author\').value.trim();' + // 获取作者
-    'const content = document.getElementById(\'comment-content\').value.trim();' + // 获取评论内容
-    'if (!author || !content) {' + // 校验输入
-    'alert(\'昵称和评论内容不能为空！\');' + // 提示错误
-    'return;' + // 阻止提交
-    '}' +
-    'const res = await fetch(\'/api/comments\', {' + // 调用评论提交接口
-    'method: \'POST\',' + // POST 方法
-    'headers: { \'content-type\': \'application/json\' },' + // JSON 类型
-    'body: JSON.stringify({ slug: \'' + escapeHtml(slug) + '\', author, content })' + // 请求体
-    '});' +
-    'const msgSpan = document.getElementById(\'comment-msg\');' + // 获取消息显示元素
-    'if (res.ok) {' + // 如果成功
-    'msgSpan.textContent = \'评论提交成功！\';' + // 显示成功消息
-    'document.getElementById(\'comment-author\').value = \'\';' + // 清空作者输入
-    'document.getElementById(\'comment-content\').value = \'\';' + // 清空评论内容
-    'const commentsRes = await fetch(\'/api/comments/' + escapeHtml(slug) + '\');' + // 获取最新评论
-    'if (commentsRes.ok) {' + // 如果成功
-    'const newComments = await commentsRes.json();' + // 解析评论
-    'const commentsList = document.getElementById(\'comments-list\');' + // 获取评论列表容器
-    'commentsList.innerHTML = newComments.map(c => {' + // 更新评论列表
-    'const cAuthor = escapeHtml(c.author);' + // 转义评论作者
-    'const cContent = escapeHtml(c.content);' + // 转义评论内容
-    'const cTimestamp = new Date(c.timestamp).toLocaleString();' + // 格式化评论时间
-    'return \'<div class="comment-item">\' +' + // 评论项容器
-    '\'<div class="comment-meta">\' +' + // 评论元信息容器
-    '\'<span class="comment-author">\' + cAuthor + \'</span>\' +' + // 作者
-            '\'<span class="comment-time">\' + cTimestamp + \'</span>\' +' + // 时间
-    '\'</div>\' +' + // 结束评论元信息容器
-    '\'<div class="comment-content">\' + cContent + \'</div>\' +' + // 评论内容
-    '\'</div>\';' + // 结束评论项容器
-    '}).join(\'\');' +
-    '}' +
-    '} else {' + // 如果失败
-    'msgSpan.textContent = \'评论提交失败！\';' + // 显示失败消息
-    '}' +
-    '};' +
-    '</script>'; // 脚本结束
-  return renderLayout(slug, inner); // 返回布局包裹的页面
 } // 结束 renderPost 函数
 
 // HTML 文本转义
@@ -804,7 +937,7 @@ function renderAbout() {
       </p>
       <div style="margin-top: 40px;">
         <h3>联系方式</h3>
-        <p>Email: mr.lemon@lemonworld.dpdns.org</p>
+        <p>Email: <a href="mailto:mr.lemon@lemonworld.dpdns.org" target="_blank" style="color: inherit; text-decoration: none;">mr.lemon@lemonworld.dpdns.org</a></p>
       </div>
     </div>
   `;
@@ -824,15 +957,21 @@ function renderCategory(posts, category) {
 // 从 KV 读取文章
 async function loadPostFromKV(env, slug) { // 定义从 KV 读取文章函数
   if (!env.POSTS) return null; // 若未绑定 KV 返回空
-  const raw = await env.POSTS.get(`post:${slug}`); // 读取 KV 中的文章
+  // 优先尝试 posts/ 前缀（新路径）
+  let raw = await env.POSTS.get(`posts/${slug}`); 
+  if (!raw) {
+    // 兼容旧的 post: 前缀
+    raw = await env.POSTS.get(`post:${slug}`);
+  }
   if (!raw) return null; // 若不存在返回空
   try { return JSON.parse(raw); } catch { return null; } // 解析 JSON 并返回
 } // 结束 loadPostFromKV 函数
 
 // 保存文章到 KV 并更新索引
 async function savePostToKV(env, item) { // 定义保存文章函数
-  await env.POSTS.put(`post:${item.slug}`, JSON.stringify(item)); // 写入文章详情
-  console.log(`Saved post: ${item.slug}`); // 记录保存的文章
+  // 统一存储在 posts/slug 路径下
+  await env.POSTS.put(`posts/${item.slug}`, JSON.stringify(item)); 
+  console.log(`Saved post: posts/${item.slug}`); // 记录保存的文章
   const idx = await getIndexFromKV(env); // 读取当前索引
   const map = new Map(idx.map(x => [x.slug, x])); // 构建映射
   map.set(item.slug, { slug: item.slug, title: item.title, date: item.date, desc: item.desc, tags: item.tags }); // 更新条目
@@ -844,7 +983,9 @@ async function savePostToKV(env, item) { // 定义保存文章函数
 // 从 KV 删除文章并更新索引
 async function deletePostFromKV(env, slug) { // 定义从 KV 删除文章函数
   if (!env.POSTS) return; // 若未绑定 KV 则直接返回
-  await env.POSTS.delete(`post:${slug}`); // 从 KV 删除文章详情
+  // 同时尝试删除新旧前缀
+  await env.POSTS.delete(`posts/${slug}`);
+  await env.POSTS.delete(`post:${slug}`);
   console.log(`Deleted post: ${slug}`); // 记录删除的文章
   const idx = await getIndexFromKV(env); // 读取当前索引
   const arr = idx.filter(x => x.slug !== slug); // 从索引中移除被删除的文章

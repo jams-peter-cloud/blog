@@ -193,6 +193,34 @@ html, body { /* 设置页面基础样式 */
   line-height: 1.8; /* 行高 */
 }
 
+/* 代码块样式 */
+.post pre {
+  background: #1e1e1e; /* 代码块背景 */
+  color: #d4d4d4; /* 代码颜色 */
+  padding: 16px; /* 内边距 */
+  border-radius: 8px; /* 圆角 */
+  overflow-x: auto; /* 超出滚动 */
+  font-family: Consolas, Monaco, 'Andale Mono', 'Ubuntu Mono', monospace; /* 等宽字体 */
+  margin-bottom: 1.2em; /* 底部间距 */
+  border: 1px solid rgba(255,255,255,0.1); /* 细边框 */
+}
+
+.post code {
+  background: rgba(255,255,255,0.1); /* 行内代码背景 */
+  padding: 2px 6px; /* 内边距 */
+  border-radius: 4px; /* 圆角 */
+  font-family: Consolas, Monaco, 'Andale Mono', 'Ubuntu Mono', monospace; /* 等宽字体 */
+  font-size: 0.9em; /* 稍微缩小字号 */
+}
+
+.post pre code {
+  background: transparent; /* 代码块内的代码不需背景 */
+  padding: 0; /* 去除内边距 */
+  border-radius: 0; /* 去除圆角 */
+  color: inherit; /* 继承颜色 */
+  font-size: 1em; /* 恢复字号 */
+}
+
 /* 评论区样式 */
 .comments-section { /* 评论区容器 */
   margin-top: 36px; /* 顶部外边距 */
